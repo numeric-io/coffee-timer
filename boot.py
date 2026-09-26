@@ -44,3 +44,12 @@ button.deinit()
 
 if not computer_edit:
     storage.remount("/", readonly=False)
+    # One line per start in /wake.log (app.py adds the rest of the wake),
+    # so starts from real deep sleep can be checked later from a computer.
+    try:
+        import microcontroller
+        with open("/wake.log", "a") as f:
+            f.write("--- boot.py: reset=%s wake_reason=%d\n" % (
+                str(microcontroller.cpu.reset_reason).split(".")[-1], reason))
+    except Exception:
+        pass

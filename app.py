@@ -95,6 +95,14 @@ BREW_LIGHT = False
 # or an app's incoming webhook -- both take {"text": ...}). Costs a few
 # seconds of Wi-Fi per brew; if Wi-Fi or Slack fails, the timer carries on.
 SLACK_ON_BREW = True
+# Append each wake's progress lines to /wake.log on the drive (readable from
+# a computer later), so wakes from real deep sleep -- on a charger or
+# battery, where there's no serial console -- can be diagnosed. Capped at
+# WAKE_LOG_MAX bytes. Turn off once things are stable: it writes flash on
+# every wake.
+WAKE_LOG = True
+WAKE_LOG_PATH = "/wake.log"
+WAKE_LOG_MAX = 16 * 1024
 
 REGULAR, DECAF, NONE = 1, 2, 0
 NEVER = 0xFFFFFFFF
@@ -600,9 +608,30 @@ _hw = {}  # lets the crash handler release the button pins
 
 
 def log(wake_start, msg):
-    """Timestamped progress line for the serial console, so a wake that
-    gets stuck shows where."""
-    print("[%5.1fs] %s" % (time.monotonic() - wake_start, msg))
+    """Timestamped progress line for the serial console (and /wake.log), so
+    a wake that gets stuck shows where."""
+    line = "[%5.1fs] %s" % (time.monotonic() - wake_start, msg)
+    print(line)
+    if WAKE_LOG:
+        try:
+            with open(WAKE_LOG_PATH, "a") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass  # drive not writable by code (no boot.py / edit mode)
+
+
+def trim_wake_log():
+    """Keep /wake.log under WAKE_LOG_MAX by dropping its older half."""
+    import os
+    try:
+        if os.stat(WAKE_LOG_PATH)[6] <= WAKE_LOG_MAX:
+            return
+        with open(WAKE_LOG_PATH) as f:
+            tail = f.read()[-WAKE_LOG_MAX // 2:]
+        with open(WAKE_LOG_PATH, "w") as f:
+            f.write(tail[tail.find("\n") + 1:])
+    except OSError:
+        pass
 
 
 def read_boot_wake():
@@ -627,6 +656,19 @@ def main():
     except Exception:
         pass
     magtag.peripherals.neopixel_disable = True
+
+    if WAKE_LOG:
+        import microcontroller
+        trim_wake_log()
+        now = time.localtime()
+        try:
+            battery = "%.2fV" % magtag.peripherals.battery
+        except Exception:
+            battery = "?"
+        log(wake_start, "=== %04d-%02d-%02d %02d:%02d:%02d UTC  reset=%s  battery=%s"
+            % (now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, now.tm_min,
+               now.tm_sec, str(microcontroller.cpu.reset_reason).split(".")[-1],
+               battery))
 
     (tick, brews, types, epochs, last_sync, valid, last_try, tries,
      first_boot) = load_state()
