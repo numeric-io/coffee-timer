@@ -20,3 +20,9 @@ WIFI_PASSWORD_1 = "your-password"
 # Slack: a Workflow Builder "From a webhook" trigger with a `text` variable,
 # or an app's incoming webhook. Each brew posts a message.
 # SLACK_WEBHOOK_URL = "https://hooks.slack.com/triggers/..."
+
+# Self-update app.py from GitHub on each brew (updater.py). For a private
+# repo, a fine-grained token limited to this repo with Contents: read-only.
+# GITHUB_REPO = "numeric-io/coffee-timer"
+# GITHUB_TOKEN = "github_pat_..."
+# GITHUB_BRANCH = "main"
