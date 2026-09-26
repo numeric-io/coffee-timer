@@ -147,7 +147,8 @@ def divider(parent, y0, y1):
     for x in (DIVIDER_X, DIVIDER_X + 1):
         parent.append(Line(x, y0, x, y1, PALETTE[BLACK]))
 
-# sleep_memory layout (33 of the ESP32-S2's 4096 bytes):
+# sleep_memory layout (33 of the ESP32-S2's 4096 bytes; the last 34 bytes
+# are the last-good Wi-Fi network and boot.py's wake reason):
 #   magic, tick_now, brew0, brew1, type0, type1,
 #   epoch0, epoch1 (UTC brew times, 0 = clock was invalid),
 #   last_sync (UTC epoch of last NTP sync), clock_valid, last_try_tick,
@@ -228,7 +229,39 @@ def wifi_networks():
         if ssid:
             networks.append((ssid, os.getenv("WIFI_PASSWORD_%d" % i) or "",
                              int(os.getenv("WIFI_CHANNEL_%d" % i) or 0)))
+    # Try the network that last worked first, so one that's out of range
+    # (e.g. home Wi-Fi when the board is at the office) doesn't cost its
+    # full 8 s connect timeout on every brew.
+    last = _last_network()
+    for i, net in enumerate(networks):
+        if net[0] == last:
+            networks.insert(0, networks.pop(i))
+            break
     return networks
+
+
+# sleep_memory's last byte is boot.py's wake reason; the 33 bytes before
+# it hold the name of the network that last connected (length + UTF-8).
+_NET_LEN = 33
+
+
+def _last_network():
+    mem = alarm.sleep_memory
+    start = len(mem) - 1 - _NET_LEN
+    n = mem[start]
+    if not 0 < n < _NET_LEN:
+        return None
+    try:
+        return bytes(mem[start + 1:start + 1 + n]).decode()
+    except Exception:
+        return None
+
+
+def _remember_network(ssid):
+    data = ssid.encode()[:_NET_LEN - 1]
+    mem = alarm.sleep_memory
+    start = len(mem) - 1 - _NET_LEN
+    mem[start:start + 1 + len(data)] = bytes([len(data)]) + data
 
 
 def try_time_sync(budget=20):
@@ -259,6 +292,7 @@ def try_time_sync(budget=20):
             if not wifi.radio.connected or wifi.radio.ap_info.ssid != ssid:
                 wifi.radio.connect(ssid, password, channel=channel,
                                    timeout=min(8, int(remaining)))
+            _remember_network(ssid)
             pool = socketpool.SocketPool(wifi.radio)
             try:
                 ntp = adafruit_ntp.NTP(pool, tz_offset=0, socket_timeout=5)
@@ -286,6 +320,7 @@ def _wifi_join(deadline):
         try:
             wifi.radio.connect(ssid, password, channel=channel,
                                timeout=min(8, int(remaining)))
+            _remember_network(ssid)
             return True
         except Exception as e:
             print("wifi: failed on %r: %r" % (ssid, e))
