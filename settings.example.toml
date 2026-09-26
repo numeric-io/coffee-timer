@@ -1,0 +1,22 @@
+# Copy this file to the CIRCUITPY drive as settings.toml (same folder as
+# code.py) and fill in the real values. Never commit the real file.
+
+# Skip CircuitPython's 1 s yellow "press RESET for safe mode" blink, which
+# otherwise runs at every wake from deep sleep. Delete this line (or set it
+# to 1) and press RESET twice during the yellow blinks if you need safe mode.
+CIRCUITPY_SAFE_MODE_DELAY = 0
+
+# Wi-Fi networks, tried in order (1 through 9). Don't use
+# CIRCUITPY_WIFI_SSID: CircuitPython joins that one at every boot and
+# blocks for up to 8 s, which makes the buttons unresponsive.
+# 2.4 GHz only. For a hidden network, WIFI_CHANNEL_n (1-13) can help.
+WIFI_SSID_1 = "your-network"
+WIFI_PASSWORD_1 = "your-password"
+# WIFI_CHANNEL_1 = 6
+
+# WIFI_SSID_2 = "backup-network"
+# WIFI_PASSWORD_2 = "backup-password"
+
+# Slack: a Workflow Builder "From a webhook" trigger with a `text` variable,
+# or an app's incoming webhook. Each brew posts a message.
+# SLACK_WEBHOOK_URL = "https://hooks.slack.com/triggers/..."

@@ -1,0 +1,6 @@
+# Real settings hold Wi-Fi passwords, the Slack webhook and the GitHub
+# token -- they live only on the board. See settings.example.toml.
+settings.toml
+.DS_Store
+._*
+__pycache__/
