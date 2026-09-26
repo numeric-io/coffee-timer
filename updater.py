@@ -175,6 +175,12 @@ def check(join, budget=30):
         base = "https://api.github.com/repos/" + repo
         sha = _get(session, base + "/commits/" + branch,
                    "application/vnd.github.sha", 10).strip()
+        if not state.get("sha"):
+            # First check after a hand install: assume the installed app.py
+            # is the branch head rather than downloading it to compare.
+            state["sha"] = sha
+            save(state)
+            return "baseline " + sha[:7]
         if sha == state.get("sha") or sha == state.get("bad_sha"):
             save(state)
             return "current"

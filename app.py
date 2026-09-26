@@ -564,6 +564,22 @@ def pulse_brew_light(magtag, brew_type, slot, seconds=10):
 _hw = {}  # lets the crash handler release the button pins
 
 
+def log(wake_start, msg):
+    """Timestamped progress line for the serial console, so a wake that
+    gets stuck shows where."""
+    print("[%5.1fs] %s" % (time.monotonic() - wake_start, msg))
+
+
+def read_boot_wake():
+    """The wake reason boot.py saved in the last byte of sleep_memory
+    (0 none, 1-4 BUTTON_A-D, 5 other pin, 10 timer), or None without a
+    boot.py that records it. Marks it read so it's never reused."""
+    mem = alarm.sleep_memory
+    reason = mem[len(mem) - 1]
+    mem[len(mem) - 1] = 0xFF
+    return None if reason == 0xFF else reason
+
+
 def main():
     wake_start = time.monotonic()
     magtag = MagTag()
@@ -581,27 +597,29 @@ def main():
      first_boot) = load_state()
 
     wake = alarm.wake_alarm
+    boot_wake = read_boot_wake()
+    log(wake_start, "wake: alarm.wake_alarm=%r, boot.py saw %r" % (wake, boot_wake))
 
+    # The press is long over by the time boot + imports finish, so the
+    # button's live state is useless -- the alarm records which pin fired.
+    # Prefer alarm.wake_alarm; fall back to what boot.py recorded, since
+    # CircuitPython can lose the wake pin by the time code.py runs.
     pressed = None
     if isinstance(wake, alarm.pin.PinAlarm):
-        # The press is long over by the time boot + imports finish, so the
-        # button's live state is useless -- the alarm records which pin fired.
         for i, p in enumerate(BUTTON_PINS):
             if wake.pin == p:
                 pressed = i
                 break
-        else:
-            # Fallback: live button state (library order is A, B, C, D).
-            for j, btn in enumerate(magtag.peripherals.buttons):
-                if not btn.value:  # buttons read LOW when pressed
-                    pressed = j
-                    break
-        if pressed in BUTTON_ACTIONS:
-            slot, brew_type = BUTTON_ACTIONS[pressed]
-            brews[slot] = tick
-            types[slot] = brew_type
-            epochs[slot] = time.time() if valid else 0
-    elif isinstance(wake, alarm.time.TimeAlarm):
+    if pressed is None and boot_wake is not None and 1 <= boot_wake <= 4:
+        pressed = boot_wake - 1
+    timer_wake = pressed is None and (
+        isinstance(wake, alarm.time.TimeAlarm) or boot_wake == 10)
+    if pressed in BUTTON_ACTIONS:
+        slot, brew_type = BUTTON_ACTIONS[pressed]
+        brews[slot] = tick
+        types[slot] = brew_type
+        epochs[slot] = time.time() if valid else 0
+    elif timer_wake:
         tick += 1
 
     is_active = any((minutes_left(tick, brews, s) or 0) > 0 for s in (0, 1))
@@ -615,7 +633,7 @@ def main():
     # beat while anything is counting down -- so two pots brewed a few
     # minutes apart still update together, not on separate minutes. The
     # board still wakes every minute to keep time, just without a flash.
-    went_stale = isinstance(wake, alarm.time.TimeAlarm) and any(
+    went_stale = timer_wake and any(
         brews[s] != NEVER and minutes_left(tick, brews, s) == 0
         and minutes_left(tick - 1, brews, s) > 0 for s in (0, 1))
     on_beat = is_active and tick % DISPLAY_STEP == 0
@@ -623,6 +641,7 @@ def main():
         display = magtag.graphics.display
         display.root_group = render(tick, brews, types, epochs)
         safe_refresh(display)
+        log(wake_start, "screen refreshed")
 
     # Pulse the brew light AFTER the e-ink refresh, so the screen updates
     # immediately and the 10 s pulse runs last before deep sleep.
@@ -634,7 +653,9 @@ def main():
     # Its Wi-Fi connection is reused by the clock sync below if needed.
     if SLACK_ON_BREW and pressed in BUTTON_ACTIONS:
         slot, brew_type = BUTTON_ACTIONS[pressed]
-        post_slack(brew_message(slot, brew_type, epochs[slot]))
+        log(wake_start, "slack: posting")
+        log(wake_start, "slack: sent=%r"
+            % post_slack(brew_message(slot, brew_type, epochs[slot])))
 
     # --- wall-clock sync (best effort; the timer works without it) ---
     # Done last, after the screen and lights, so a slow or failing network
@@ -650,7 +671,9 @@ def main():
     if (not valid and tries < MAX_SYNC_TRIES
             and (first_boot or tick - last_try >= SYNC_RETRY_TICKS)):
         last_try = tick
+        log(wake_start, "clock: syncing")
         now = try_time_sync()
+        log(wake_start, "clock: %s" % ("synced" if now else "no sync"))
         if now is not None:
             valid, last_sync, tries = True, now, 0
             backfill_epochs(now, tick, brews, epochs)
@@ -666,7 +689,8 @@ def main():
         try:
             import updater
             if updater.configured():
-                print("update:", updater.check(_wifi_join))
+                log(wake_start, "update: checking")
+                log(wake_start, "update: %s" % updater.check(_wifi_join))
         except ImportError:
             pass
 
@@ -681,6 +705,8 @@ def main():
 
     pin_alarms = [alarm.pin.PinAlarm(pin=p, value=False, pull=True)
                   for p in BUTTON_PINS]
+    log(wake_start, "sleeping (%s)" % ("minute timer + buttons" if is_active
+                                     else "buttons only"))
     if is_active:
         # measured from the start of this wake, so a slow wake (refresh,
         # light pulse, Wi-Fi) doesn't stretch the minute
