@@ -29,8 +29,7 @@ Slack: with SLACK_WEBHOOK_URL in settings.toml, each brew also posts
 channel (see SLACK_ON_BREW).
 
 Power: the board deep-sleeps between events. A button press wakes it via
-PinAlarm and records a brew (optionally pulsing the NeoPixels for 10 s --
-see BREW_LIGHT) before sleeping again; a TimeAlarm
+PinAlarm and records a brew before sleeping again; a TimeAlarm
 wakes it every 60 s while a pot is still fresh to tick the countdown. Once
 every pot is stale (or nothing
 was ever brewed) no timer is set at all: the e-ink image simply holds with
@@ -38,15 +37,14 @@ zero power until the next button press. Brew state lives in
 alarm.sleep_memory so it survives sleep.
 
 Hardware: CircuitPython 10.x or later is REQUIRED (2025 SSD1680 display).
-Install the matching 10.x Adafruit library bundle (adafruit_magtag,
-adafruit_display_text, adafruit_display_shapes, adafruit_ntp) into /lib,
+Install the matching 10.x Adafruit library bundle (adafruit_display_text,
+adafruit_display_shapes, adafruit_ntp, adafruit_requests) into /lib,
 then copy this file to the CIRCUITPY drive as app.py, next to code.py (the
 loader), updater.py and boot.py. With GITHUB_REPO in settings.toml, this
 file then updates itself from GitHub whenever someone brews (updater.py).
 Running timers survive an update: they live in sleep_memory, not here.
 """
 
-import math
 import struct
 import time
 
@@ -63,7 +61,6 @@ try:
     from adafruit_display_text import label
     from adafruit_display_shapes.rect import Rect
     from adafruit_display_shapes.line import Line
-    from adafruit_magtag.magtag import MagTag
 except ImportError as err:
     # Autoreload is off, so writing this file can't trigger a reload loop.
     # It names the missing library -- the usual cause of "Code done
@@ -85,11 +82,6 @@ MAX_SYNC_TRIES = 3  # then give up on Wi-Fi until reset, to save battery
 # refreshes (with its full black/white flash) when what it shows changes:
 # 5 -> ~12 flashes per pot instead of 60. Set to 1 for a per-minute display.
 DISPLAY_STEP = 2
-# Pulse the NeoPixels for 10 s after a brew (green = regular, orange =
-# decaf). Off by default: the case hides them, and skipping the pulse keeps
-# each brew wake 10 s shorter -- better battery, and the next press is
-# picked up sooner.
-BREW_LIGHT = False
 # Post to Slack on every brew when SLACK_WEBHOOK_URL is set in settings.toml
 # (a Slack Workflow Builder "From a webhook" trigger with a `text` variable,
 # or an app's incoming webhook -- both take {"text": ...}). Costs a few
@@ -560,51 +552,12 @@ def safe_refresh(display, timeout=30):
             time.sleep(1)
 
 # ---------------------------------------------------------------- main
-# NeoPixel feedback: green glow = regular, orange glow = decaf. NeoPixel
-# green runs bright, so orange needs very little of it or it reads yellow.
-BREW_LIGHT_COLORS = {REGULAR: 0x00FF00, DECAF: 0xFF2A00}
-BREATH_PERIOD = 2.5  # seconds per slow in-and-out breath
-FADE_OUT = 1.5  # seconds of final fade to dark
-
-
-def pulse_brew_light(magtag, brew_type, slot, seconds=10):
-    """Pulse the NeoPixels for ~10 s after a brew: green for regular,
-    orange for decaf -- but only the two pixels on that carafe's side
-    (left pair for the left carafe, right pair for the right). The board
-    stays awake for this (a few mA for 10 s is negligible on the
-    420 mAh cell), then the pixels are powered back down so deep sleep
-    stays at zero draw."""
-    color = BREW_LIGHT_COLORS.get(brew_type, 0xFFFFFF)
-    # NeoPixel 0 is the rightmost LED (silkscreen #0 is on the right);
-    # indices run right-to-left, so the left carafe uses the high indices.
-    side = (3, 2) if slot == 0 else (1, 0)
-    try:
-        magtag.peripherals.neopixel_disable = False
-        pixels = magtag.peripherals.neopixels
-        pixels.fill(0x000000)
-        pixels.brightness = 0.5
-        r, g, b = (color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF
-        start = time.monotonic()
-        while True:
-            t = time.monotonic() - start
-            if t >= seconds:
-                break
-            envelope = min(1.0, (seconds - t) / FADE_OUT)
-            # smooth sine breathing; the second LED trails the first by a
-            # quarter breath so the glow sways between them
-            for k, i in enumerate(side):
-                wave = 0.5 - 0.5 * math.cos(
-                    2 * math.pi * (t / BREATH_PERIOD - k * 0.25))
-                level = (0.06 + 0.94 * wave) * envelope
-                pixels[i] = (int(r * level), int(g * level), int(b * level))
-            time.sleep(0.02)
-        pixels.fill(0x000000)
-        magtag.peripherals.neopixel_disable = True
-    except Exception:
-        pass  # pixels must never break the timer
-
-
-_hw = {}  # lets the crash handler release the button pins
+# Lines logged before the screen refresh are held in memory and written in
+# one go right after it (log_flush): a flash write costs up to 0.3 s, and
+# the refresh is the only sign a button press registered. After the flush,
+# lines are written as they happen, so a wake that hangs (e.g. on the
+# network) still shows where.
+_wake_log = {"pending": [], "live": False}
 
 
 def log(wake_start, msg):
@@ -612,12 +565,41 @@ def log(wake_start, msg):
     a wake that gets stuck shows where."""
     line = "[%5.1fs] %s" % (time.monotonic() - wake_start, msg)
     print(line)
-    if WAKE_LOG:
-        try:
-            with open(WAKE_LOG_PATH, "a") as f:
+    if not WAKE_LOG:
+        return
+    if not _wake_log["live"]:
+        _wake_log["pending"].append(line)
+        return
+    try:
+        with open(WAKE_LOG_PATH, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass  # drive not writable by code (no boot.py / edit mode)
+
+
+def log_flush():
+    """Write the held lines to /wake.log and log live from here on."""
+    if not WAKE_LOG or _wake_log["live"]:
+        return
+    _wake_log["live"] = True
+    trim_wake_log()
+    try:
+        with open(WAKE_LOG_PATH, "a") as f:
+            for line in _wake_log["pending"]:
                 f.write(line + "\n")
-        except OSError:
-            pass  # drive not writable by code (no boot.py / edit mode)
+    except OSError:
+        pass
+    _wake_log["pending"] = []
+
+
+def battery_volts():
+    """Battery voltage from the MagTag's divider on board.BATTERY."""
+    import analogio
+    pin = analogio.AnalogIn(board.BATTERY)
+    try:
+        return pin.value / 65535 * pin.reference_voltage * 2
+    finally:
+        pin.deinit()
 
 
 def trim_wake_log():
@@ -646,23 +628,15 @@ def read_boot_wake():
 
 def main():
     wake_start = time.monotonic()
-    magtag = MagTag()
-    _hw["magtag"] = magtag
-    # The MagTag library powers the NeoPixels on while it starts up. Write
-    # black first, so they can't show whatever color they wake up holding,
-    # then cut their power.
-    try:
-        magtag.peripherals.neopixels.fill(0x000000)
-    except Exception:
-        pass
-    magtag.peripherals.neopixel_disable = True
+    # No adafruit_magtag: loading it cost ~0.6 s per wake, and it powered
+    # the NeoPixels on at startup. The display is board.DISPLAY, and the
+    # buttons are only ever read through the wake alarm.
 
     if WAKE_LOG:
         import microcontroller
-        trim_wake_log()
         now = time.localtime()
         try:
-            battery = "%.2fV" % magtag.peripherals.battery
+            battery = "%.2fV" % battery_volts()
         except Exception:
             battery = "?"
         # wake_start is seconds since the chip started: on a wake from real
@@ -719,16 +693,12 @@ def main():
         and minutes_left(tick - 1, brews, s) > 0 for s in (0, 1))
     on_beat = is_active and tick % DISPLAY_STEP == 0
     if first_boot or pressed is not None or went_stale or on_beat:
-        display = magtag.graphics.display
+        display = board.DISPLAY
+        display.rotation = 270  # landscape (the board default, made explicit)
         display.root_group = render(tick, brews, types, epochs)
         safe_refresh(display)
         log(wake_start, "screen refreshed")
-
-    # Pulse the brew light AFTER the e-ink refresh, so the screen updates
-    # immediately and the 10 s pulse runs last before deep sleep.
-    if BREW_LIGHT and pressed in BUTTON_ACTIONS:
-        slot, brew_type = BUTTON_ACTIONS[pressed]
-        pulse_brew_light(magtag, brew_type, slot)
+    log_flush()  # the screen is updating: now it's fine to write flash
 
     # Slack alert, also after the screen so it never delays the display.
     # Its Wi-Fi connection is reused by the clock sync below if needed.
@@ -789,15 +759,6 @@ def main():
                 log(wake_start, "update: %s" % updater.check(_wifi_join))
         except ImportError:
             pass
-
-    # Free the button pins before arming PinAlarms: the Peripherals object
-    # still holds DigitalInOuts on them, and deep sleep refuses pins that
-    # are already claimed. Only the buttons are released -- a full
-    # peripherals.deinit() would also cut the NeoPixel power pin loose, so
-    # it stays explicitly driven off instead.
-    for button in magtag.peripherals.buttons:
-        button.deinit()
-    magtag.peripherals.neopixel_disable = True
 
     pin_alarms = [alarm.pin.PinAlarm(pin=p, value=False, pull=True)
                   for p in BUTTON_PINS]
@@ -869,14 +830,14 @@ except Exception as exc:  # noqa: BLE001 -- diagnostic: surface it
             traceback.print_exception(exc, file=f)
     except Exception:
         pass
+    try:
+        log_flush()
+    except Exception:
+        pass
     show_error(exc)
     # Deep-sleep until a button press restarts code.py, rather than hanging
     # awake (unresponsive, draining the battery) until a manual reset.
     try:
-        mt = _hw.get("magtag")
-        if mt:
-            for button in mt.peripherals.buttons:
-                button.deinit()
         alarm.exit_and_deep_sleep_until_alarms(
             *[alarm.pin.PinAlarm(pin=p, value=False, pull=True)
               for p in BUTTON_PINS])

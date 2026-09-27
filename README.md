@@ -28,7 +28,7 @@ Freshness timer for two office coffee carafes on an Adafruit MagTag
 ## Setup
 
 1. Install CircuitPython 10.x and the matching library bundle's
-   `adafruit_magtag`, `adafruit_display_text`, `adafruit_display_shapes`,
+   `adafruit_display_text`, `adafruit_display_shapes`,
    `adafruit_ntp`, `adafruit_requests` and `adafruit_connection_manager`
    into `/lib` (plus their dependencies).
 2. Copy `app.py`, `code.py`, `updater.py` and `boot.py` to CIRCUITPY.

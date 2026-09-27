@@ -44,12 +44,6 @@ button.deinit()
 
 if not computer_edit:
     storage.remount("/", readonly=False)
-    # One line per start in /wake.log (app.py adds the rest of the wake),
-    # so starts from real deep sleep can be checked later from a computer.
-    try:
-        import microcontroller
-        with open("/wake.log", "a") as f:
-            f.write("--- boot.py: reset=%s wake_reason=%d\n" % (
-                str(microcontroller.cpu.reset_reason).split(".")[-1], reason))
-    except Exception:
-        pass
+# No flash writes here: the first write of a wake costs ~0.3 s, and this
+# runs before the screen refresh. app.py logs the reset and wake reason
+# after the refresh instead.
