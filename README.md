@@ -6,7 +6,7 @@ Freshness timer for two office coffee carafes on an Adafruit MagTag
 - **Buttons:** the left pair is regular / decaf for the left carafe, the
   right pair is regular / decaf for the right carafe.
 - **Screen:** each half shows the type, when it was brewed and minutes
-  left, and turns STALE after 60 minutes.
+  left (in 2-minute steps), and turns STALE after 120 minutes.
 - **Slack:** each brew can post to a channel (`SLACK_WEBHOOK_URL`).
 - **Battery:** the board deep-sleeps between events, waking every minute
   only while a pot is fresh.

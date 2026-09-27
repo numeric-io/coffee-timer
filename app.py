@@ -78,13 +78,13 @@ except ImportError as err:
 # ---------------------------------------------------------------- config
 
 DESIGN = "carafes"  # "freshness" or "carafes"
-FRESH_MINUTES = 60
+FRESH_MINUTES = 120
 SYNC_RETRY_TICKS = 30  # re-attempt a failed clock sync after this many ticks
 MAX_SYNC_TRIES = 3  # then give up on Wi-Fi until reset, to save battery
 # The countdown is shown in steps of this many minutes, and the e-ink only
 # refreshes (with its full black/white flash) when what it shows changes:
 # 5 -> ~12 flashes per pot instead of 60. Set to 1 for a per-minute display.
-DISPLAY_STEP = 1
+DISPLAY_STEP = 2
 # Pulse the NeoPixels for 10 s after a brew (green = regular, orange =
 # decaf). Off by default: the case hides them, and skipping the pulse keeps
 # each brew wake 10 s shorter -- better battery, and the next press is
@@ -137,6 +137,11 @@ TYPE_NAMES = {REGULAR: "REGULAR", DECAF: "DECAF", NONE: "--"}
 # fonts, so the scale is measured from the actual font instead of hard-coded.
 _TYPE_W = terminalio.FONT.get_bounding_box()[0] * len("REGULAR")
 TYPE_SCALE = max(1, min(3, (WIDTH // 2 - 8) // _TYPE_W))
+# The big countdown uses the largest scale (up to 6) at which its widest
+# value -- the full pot, e.g. "120m" -- fits a screen half with a margin,
+# so it stays one size all the way down.
+_TIMER_W = terminalio.FONT.get_bounding_box()[0] * len("%dm" % FRESH_MINUTES)
+TIMER_SCALE = max(1, min(6, (WIDTH // 2 - 20) // _TIMER_W))
 # carafes layout: vertical center of the big countdown. Sits a few px below
 # the type label so they don't touch, and still clears the bar at y=100.
 TIMER_Y = 67
@@ -425,7 +430,7 @@ def minutes_left(tick, brews, slot):
 def panel(tick, brews, types, epochs, half):
     """What one half of the screen shows: (brew_label, type_name, big_text,
     bar_frac). The countdown is rounded up to DISPLAY_STEP, like a timer:
-    56-60 minutes left shows "60m"."""
+    with a 2-minute step, 119-120 minutes left shows "120m"."""
     left = minutes_left(tick, brews, half)
     type_name = TYPE_NAMES[types[half]]
     if left is None:
@@ -434,7 +439,7 @@ def panel(tick, brews, types, epochs, half):
     if epochs[half]:
         brew_label = "BREWED " + brew_time_str(epochs[half])
     elif left == 0:
-        brew_label = "BREWED 1H+ AGO"
+        brew_label = "BREWED %dH+ AGO" % (FRESH_MINUTES // 60)
     else:
         # no wall clock (Wi-Fi off/failed): count from the minute ticks
         ago = FRESH_MINUTES - shown
@@ -515,9 +520,10 @@ def render_carafes(group, tick, brews, types, epochs):
         text(group, brew_label, cx, 10, scale=1, color=DARK)
         text(group, type_name, cx, 28, scale=TYPE_SCALE)
         if frac is None:
-            text(group, "--", cx, TIMER_Y, scale=6, color=DARK)
+            text(group, "--", cx, TIMER_Y, scale=TIMER_SCALE, color=DARK)
         else:
-            text(group, big, cx, TIMER_Y, scale=3 if big == "STALE" else 6)
+            text(group, big, cx, TIMER_Y,
+                 scale=3 if big == "STALE" else TIMER_SCALE)
         freshness_bar(group, half, 100, 120, frac, segs=12)
         text(group, LEGENDS[half], cx, 120, scale=1)
     divider(group, 6, 126)
