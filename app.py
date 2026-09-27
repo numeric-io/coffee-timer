@@ -278,14 +278,15 @@ def _remember_network(ssid):
 
 
 def try_time_sync(budget=20):
-    """Try each configured Wi-Fi network in order; set RTC from NTP.
+    """Set the RTC from NTP over Wi-Fi, reusing the connection if it's
+    already up (e.g. from the Slack post) and otherwise joining the first
+    configured network that works.
 
-    Returns the epoch on success, None if every network fails. Gives up
-    after roughly `budget` seconds in total so a bad network can't hold the
-    board awake. Failures are printed for the serial console.
+    Returns the epoch on success, None on failure. Gives up after roughly
+    `budget` seconds so a bad network can't hold the board awake. Failures
+    are printed for the serial console.
     """
-    networks = wifi_networks()
-    if not networks:
+    if not wifi_networks():
         return None
     deadline = time.monotonic() + budget
     try:
@@ -296,27 +297,20 @@ def try_time_sync(budget=20):
     except Exception as e:  # best effort: the timer works fine without a clock
         print("time sync unavailable:", repr(e))
         return None
-    for ssid, password, channel in networks:
-        remaining = deadline - time.monotonic()
-        if remaining < 3:
-            print("time sync: out of time budget")
-            break
+    try:
+        if not _wifi_join(deadline):
+            print("time sync: no Wi-Fi")
+            return None
+        pool = socketpool.SocketPool(wifi.radio)
         try:
-            if not wifi.radio.connected or wifi.radio.ap_info.ssid != ssid:
-                wifi.radio.connect(ssid, password, channel=channel,
-                                   timeout=min(8, int(remaining)))
-            _remember_network(ssid)
-            pool = socketpool.SocketPool(wifi.radio)
-            try:
-                ntp = adafruit_ntp.NTP(pool, tz_offset=0, socket_timeout=5)
-            except TypeError:  # older adafruit_ntp without socket_timeout
-                ntp = adafruit_ntp.NTP(pool, tz_offset=0)
-            rtc.RTC().datetime = ntp.datetime
-            print("time sync OK via", ssid)
-            return time.time()
-        except Exception as e:
-            print("time sync failed on %r: %r" % (ssid, e))
-    return None
+            ntp = adafruit_ntp.NTP(pool, tz_offset=0, socket_timeout=5)
+        except TypeError:  # older adafruit_ntp without socket_timeout
+            ntp = adafruit_ntp.NTP(pool, tz_offset=0)
+        rtc.RTC().datetime = ntp.datetime
+        return time.time()
+    except Exception as e:
+        print("time sync failed: %r" % (e,))
+        return None
 
 
 def _wifi_join(deadline):
@@ -671,10 +665,14 @@ def main():
             battery = "%.2fV" % magtag.peripherals.battery
         except Exception:
             battery = "?"
-        log(wake_start, "=== %04d-%02d-%02d %02d:%02d:%02d UTC  reset=%s  battery=%s"
+        # wake_start is seconds since the chip started: on a wake from real
+        # deep sleep, the delay before this code ran (boot, boot.py, loading
+        # app.py and its libraries).
+        log(wake_start, "=== %04d-%02d-%02d %02d:%02d:%02d UTC  reset=%s  "
+            "battery=%s  main() started %.2fs after chip start"
             % (now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, now.tm_min,
                now.tm_sec, str(microcontroller.cpu.reset_reason).split(".")[-1],
-               battery))
+               battery, wake_start))
 
     (tick, brews, types, epochs, last_sync, valid, last_try, tries,
      first_boot) = load_state()
@@ -741,27 +739,42 @@ def main():
             % post_slack(brew_message(slot, brew_type, epochs[slot])))
 
     # --- wall-clock sync (best effort; the timer works without it) ---
-    # Done last, after the screen and lights, so a slow or failing network
-    # never delays the display. A brew recorded without a clock gets its
-    # timestamp backfilled from the minute ticks once a sync succeeds.
-    # Wi-Fi is only used when there's no trustworthy clock: first boot,
-    # or the RTC was lost (it reads year 2000 after a power loss). The RTC
-    # keeps running through deep sleep, so once set it isn't re-synced.
-    # If it still fails after MAX_SYNC_TRIES, stop trying until the next
-    # reset: the timer falls back to "BREWED 12M AGO" labels.
+    # Done after the screen, so the network never delays the display.
+    # - No trustworthy clock (first boot, or the RTC reads year 2000 after
+    #   a power loss): sync, retrying every SYNC_RETRY_TICKS minutes while a
+    #   pot counts down, up to MAX_SYNC_TRIES; then fall back to "BREWED
+    #   12M AGO" labels until the next reset.
+    # - On every brew: re-sync anyway, since Wi-Fi is already up for Slack.
+    #   The MagTag has no clock crystal, so its RTC drifts a percent or two
+    #   in deep sleep (~10 min overnight). The brew's timestamp was taken
+    #   from the drifted clock a moment ago, so shift it by the correction.
     if valid and time.localtime().tm_year < 2025:
         valid, tries = False, 0
-    if (not valid and tries < MAX_SYNC_TRIES
-            and (first_boot or tick - last_try >= SYNC_RETRY_TICKS)):
-        last_try = tick
+    brewed = pressed in BUTTON_ACTIONS
+    retry_due = (not valid and tries < MAX_SYNC_TRIES
+                 and (first_boot or tick - last_try >= SYNC_RETRY_TICKS))
+    if retry_due or brewed:
+        if not valid:
+            last_try = tick
+        rtc_before, mono_before = time.time(), time.monotonic()
         log(wake_start, "clock: syncing")
         now = try_time_sync()
-        log(wake_start, "clock: %s" % ("synced" if now else "no sync"))
-        if now is not None:
-            valid, last_sync, tries = True, now, 0
-            backfill_epochs(now, tick, brews, epochs)
+        if now is None:
+            log(wake_start, "clock: no sync")
+            if not valid:
+                tries += 1
         else:
-            tries += 1
+            drift = int(round(now - (rtc_before + time.monotonic() - mono_before)))
+            if valid and brewed:
+                slot = BUTTON_ACTIONS[pressed][0]
+                if epochs[slot]:
+                    epochs[slot] += drift
+                log(wake_start, "clock: synced, board clock was off by %+ds" % drift)
+            else:
+                log(wake_start, "clock: synced")
+            if not valid:
+                backfill_epochs(now, tick, brews, epochs)
+            valid, last_sync, tries = True, now, 0
     save_state(tick, brews, types, epochs, last_sync, valid, last_try,
                tries)
 
