@@ -305,13 +305,23 @@ def try_time_sync(budget=20):
         return None
 
 
+# One Wi-Fi attempt per wake: Slack, the clock sync and the update check
+# all need the network, and if joining fails once they'd each retry every
+# configured network (8 s apiece) -- nearly a minute awake and ignoring
+# buttons on a brew when the Wi-Fi is down. After a failed join, later
+# callers in the same wake give up at once.
+_wifi = {"failed": False}
+
+
 def _wifi_join(deadline):
     """Join the first configured network that works, unless already
     connected. Returns True when connected. Failures go to the serial
-    console."""
+    console and /wake.log."""
     import wifi
     if wifi.radio.connected:
         return True
+    if _wifi["failed"]:
+        return False
     for ssid, password, channel in wifi_networks():
         remaining = deadline - time.monotonic()
         if remaining < 3:
@@ -322,7 +332,8 @@ def _wifi_join(deadline):
             _remember_network(ssid)
             return True
         except Exception as e:
-            print("wifi: failed on %r: %r" % (ssid, e))
+            _wifi_log("wifi: failed on %r: %r" % (ssid, e))
+    _wifi["failed"] = True
     return False
 
 
@@ -560,6 +571,11 @@ def safe_refresh(display, timeout=30):
 _wake_log = {"pending": [], "live": False}
 
 
+def _wifi_log(msg):
+    """Log from helpers that don't know the wake's start time."""
+    log(_wake_log.get("start", 0.0), msg)
+
+
 def log(wake_start, msg):
     """Timestamped progress line for the serial console (and /wake.log), so
     a wake that gets stuck shows where."""
@@ -628,6 +644,7 @@ def read_boot_wake():
 
 def main():
     wake_start = time.monotonic()
+    _wake_log["start"] = wake_start
     # No adafruit_magtag: loading it cost ~0.6 s per wake, and it powered
     # the NeoPixels on at startup. The display is board.DISPLAY, and the
     # buttons are only ever read through the wake alarm.
