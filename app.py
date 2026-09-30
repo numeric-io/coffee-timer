@@ -87,11 +87,14 @@ DISPLAY_STEP = 2
 # or an app's incoming webhook -- both take {"text": ...}). Costs a few
 # seconds of Wi-Fi per brew; if Wi-Fi or Slack fails, the timer carries on.
 SLACK_ON_BREW = True
-# Append each wake's progress lines to /wake.log on the drive (readable from
-# a computer later), so wakes from real deep sleep -- on a charger or
-# battery, where there's no serial console -- can be diagnosed. Capped at
-# WAKE_LOG_MAX bytes. Turn off once things are stable: it writes flash on
-# every wake.
+# Append wake progress lines to /wake.log on the drive (readable from a
+# computer later), so wakes from real deep sleep -- on a charger or battery,
+# where there's no serial console -- can be diagnosed. Capped at
+# WAKE_LOG_MAX bytes. Only wakes that do something are written (brews,
+# restarts, a pot going stale, clock-sync retries); plain minute ticks just
+# print. Every flash write rewrites the drive's file list, and a RESET or
+# power cut in the middle of one wipes it -- that is how whole groups of
+# files vanished when every minute tick was logged.
 WAKE_LOG = True
 WAKE_LOG_PATH = "/wake.log"
 WAKE_LOG_MAX = 16 * 1024
@@ -568,7 +571,7 @@ def safe_refresh(display, timeout=30):
 # the refresh is the only sign a button press registered. After the flush,
 # lines are written as they happen, so a wake that hangs (e.g. on the
 # network) still shows where.
-_wake_log = {"pending": [], "live": False}
+_wake_log = {"pending": [], "live": False, "persist": True}
 
 
 def _wifi_log(msg):
@@ -586,6 +589,8 @@ def log(wake_start, msg):
     if not _wake_log["live"]:
         _wake_log["pending"].append(line)
         return
+    if not _wake_log["persist"]:
+        return
     try:
         with open(WAKE_LOG_PATH, "a") as f:
             f.write(line + "\n")
@@ -598,6 +603,9 @@ def log_flush():
     if not WAKE_LOG or _wake_log["live"]:
         return
     _wake_log["live"] = True
+    if not _wake_log["persist"]:
+        _wake_log["pending"] = []  # a plain minute tick: don't touch flash
+        return
     trim_wake_log()
     try:
         with open(WAKE_LOG_PATH, "a") as f:
@@ -709,6 +717,14 @@ def main():
         brews[s] != NEVER and minutes_left(tick, brews, s) == 0
         and minutes_left(tick - 1, brews, s) > 0 for s in (0, 1))
     on_beat = is_active and tick % DISPLAY_STEP == 0
+
+    # Clock-sync decision (acted on after the screen, below). Made here so
+    # the wake log knows whether this minute tick is worth writing down.
+    if valid and time.localtime().tm_year < 2025:
+        valid, tries = False, 0
+    retry_due = (not valid and tries < MAX_SYNC_TRIES
+                 and (first_boot or tick - last_try >= SYNC_RETRY_TICKS))
+    _wake_log["persist"] = not timer_wake or went_stale or retry_due
     if first_boot or pressed is not None or went_stale or on_beat:
         display = board.DISPLAY
         display.rotation = 270  # landscape (the board default, made explicit)
@@ -735,11 +751,7 @@ def main():
     #   The MagTag has no clock crystal, so its RTC drifts a percent or two
     #   in deep sleep (~10 min overnight). The brew's timestamp was taken
     #   from the drifted clock a moment ago, so shift it by the correction.
-    if valid and time.localtime().tm_year < 2025:
-        valid, tries = False, 0
     brewed = pressed in BUTTON_ACTIONS
-    retry_due = (not valid and tries < MAX_SYNC_TRIES
-                 and (first_boot or tick - last_try >= SYNC_RETRY_TICKS))
     if retry_due or brewed:
         if not valid:
             last_try = tick

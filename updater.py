@@ -68,6 +68,16 @@ def save(state):
         return False
 
 
+def _writable():
+    """True if code may write CIRCUITPY (boot.py remounted it), checked
+    without writing anything."""
+    try:
+        import storage
+        return not storage.getmount("/").readonly
+    except Exception:
+        return False
+
+
 def configured():
     return bool(os.getenv("GITHUB_REPO"))
 
@@ -157,10 +167,13 @@ def check(join, budget=30):
     repo = os.getenv("GITHUB_REPO")
     if not repo:
         return "not configured"
-    state = load()
-    state["last_check"] = time.time()  # for debugging; also tests writability
-    if not save(state):
+    # Write update.json only when something changes (baseline, install,
+    # reject). Each flash write rewrites the drive's file list, and a RESET
+    # or power cut mid-write can wipe it -- so a routine "current" check
+    # must not write at all.
+    if not _writable():
         return "read-only (computer-edit mode?)"
+    state = load()
     deadline = time.monotonic() + budget
     try:
         import wifi
@@ -182,7 +195,6 @@ def check(join, budget=30):
             save(state)
             return "baseline " + sha[:7]
         if sha == state.get("sha") or sha == state.get("bad_sha"):
-            save(state)
             return "current"
         source = _get(session, base + "/contents/app.py?ref=" + sha,
                       "application/vnd.github.raw",
@@ -216,5 +228,4 @@ def check(join, budget=30):
         save(state)
         return "updated to " + sha[:7]
     except Exception as e:
-        save(state)
         return "failed: %r" % (e,)
