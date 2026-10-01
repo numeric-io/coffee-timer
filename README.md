@@ -24,6 +24,7 @@ Freshness timer for two office coffee carafes on an Adafruit MagTag
 | `boot.py` | Makes the drive writable by the board, so it can update itself. Hold the leftmost button while pressing RESET to make it writable from a computer instead. Installed by hand. |
 | `settings.example.toml` | Template for the board's `settings.toml` (Wi-Fi, Slack). The real file holds secrets and is gitignored. |
 | `wifi_test.py` | Wi-Fi / DNS / NTP diagnostic: at the serial REPL, `import wifi_test`. |
+| `backup/app.py` | Spare copy of `app.py`. `code.py` restores it if `app.py` ever goes missing; the updater refreshes it when an update is kept. |
 
 ## Setup
 
@@ -31,7 +32,8 @@ Freshness timer for two office coffee carafes on an Adafruit MagTag
    `adafruit_display_text`, `adafruit_display_shapes`,
    `adafruit_ntp`, `adafruit_requests` and `adafruit_connection_manager`
    into `/lib` (plus their dependencies).
-2. Copy `app.py`, `code.py`, `updater.py` and `boot.py` to CIRCUITPY.
+2. Copy `app.py`, `code.py`, `updater.py` and `boot.py` to CIRCUITPY, plus
+   a copy of `app.py` as `backup/app.py`.
 3. Copy `settings.example.toml` to CIRCUITPY as `settings.toml` and fill it in.
 4. Press RESET.
 
@@ -51,6 +53,24 @@ Freshness timer for two office coffee carafes on an Adafruit MagTag
    or `/lib` must be copied by hand, in computer-edit mode.
 5. Update state is in `update.json` on the drive, and messages go to the
    serial console (`update: ...`).
+
+## Keeping the drive healthy
+
+The board's flash is erased and rewritten in 4 KB chunks, and the drive's
+file list lives in one of them. A RESET or power cut in the middle of a
+write can wipe that chunk, and every file listed in it disappears at once
+(this happened three times while the board logged every wake).
+
+- The board writes nothing in normal use: `WAKE_LOG` is off by default,
+  and `update.json` changes only when an update is installed.
+- Without Wi-Fi, a brew tries once and then skips Wi-Fi for an hour
+  (`WIFI_BACKOFF`), so brews stay under a second and the board never
+  looks frozen.
+- **After copying files from a computer, eject the drive and wait for it
+  to disappear before pressing RESET.** macOS can finish writing the file
+  list several seconds after a copy appears to be done.
+- If the screen says **COFFEE TIMER CAN'T START**, `code.py` couldn't load
+  `app.py` and had no spare to restore. Plug the board into a computer.
 
 ## Hardware notes
 

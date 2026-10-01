@@ -92,10 +92,12 @@ SLACK_ON_BREW = True
 # where there's no serial console -- can be diagnosed. Capped at
 # WAKE_LOG_MAX bytes. Only wakes that do something are written (brews,
 # restarts, a pot going stale, clock-sync retries); plain minute ticks just
-# print. Every flash write rewrites the drive's file list, and a RESET or
-# power cut in the middle of one wipes it -- that is how whole groups of
-# files vanished when every minute tick was logged.
-WAKE_LOG = True
+# print. OFF by default: a RESET or power cut in the middle of a flash
+# write can wipe a 4 KB chunk of the drive, file list and all -- the log
+# was being written at the end of every brew, exactly when an impatient
+# RESET lands, and that is how app.py kept vanishing. Turn on only while
+# debugging, and don't press RESET while it's on.
+WAKE_LOG = False
 WAKE_LOG_PATH = "/wake.log"
 WAKE_LOG_MAX = 16 * 1024
 
@@ -249,8 +251,27 @@ def wifi_networks():
 
 
 # sleep_memory's last byte is boot.py's wake reason; the 33 bytes before
-# it hold the name of the network that last connected (length + UTF-8).
+# it hold the name of the network that last connected (length + UTF-8), and
+# the 4 before those the RTC time of the last failed Wi-Fi join (0 = none).
 _NET_LEN = 33
+_FAIL_LEN = 4
+# After a failed join, skip Wi-Fi for this long. Without a reachable
+# network every brew otherwise spends ~7 s trying, ignoring the buttons --
+# which looks frozen, and invites a RESET. RESET/power-on clears it, so
+# after fixing settings.toml a RESET retries straight away.
+WIFI_BACKOFF = 3600
+
+
+def _wifi_failed_at():
+    mem = alarm.sleep_memory
+    start = len(mem) - 1 - _NET_LEN - _FAIL_LEN
+    return struct.unpack("<I", bytes(mem[start:start + _FAIL_LEN]))[0]
+
+
+def _set_wifi_failed_at(t):
+    mem = alarm.sleep_memory
+    start = len(mem) - 1 - _NET_LEN - _FAIL_LEN
+    mem[start:start + _FAIL_LEN] = struct.pack("<I", int(t))
 
 
 def _last_network():
@@ -325,6 +346,13 @@ def _wifi_join(deadline):
         return True
     if _wifi["failed"]:
         return False
+    failed_at = _wifi_failed_at()
+    now = time.time()
+    if failed_at and failed_at <= now < failed_at + WIFI_BACKOFF:
+        _wifi["failed"] = True
+        _wifi_log("wifi: skipped (failed %d min ago; retries after %d min)"
+                  % ((now - failed_at) // 60, WIFI_BACKOFF // 60))
+        return False
     for ssid, password, channel in wifi_networks():
         remaining = deadline - time.monotonic()
         if remaining < 3:
@@ -333,10 +361,12 @@ def _wifi_join(deadline):
             wifi.radio.connect(ssid, password, channel=channel,
                                timeout=min(8, int(remaining)))
             _remember_network(ssid)
+            _set_wifi_failed_at(0)
             return True
         except Exception as e:
             _wifi_log("wifi: failed on %r: %r" % (ssid, e))
     _wifi["failed"] = True
+    _set_wifi_failed_at(time.time())
     return False
 
 

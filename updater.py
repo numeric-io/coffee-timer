@@ -27,6 +27,8 @@ APP = ROOT + "app.py"
 NEW = ROOT + "app.py.new"
 BAK = ROOT + "app.py.bak"
 STATE = ROOT + "update.json"
+SPARE_DIR = ROOT + "backup"
+SPARE = SPARE_DIR + "/app.py"  # restored by code.py if app.py goes missing
 
 TRIAL_BOOTS = 3
 APP_MARKER = "def main("  # a real app.py always defines main()
@@ -96,7 +98,26 @@ def begin_boot():
         del state["trial"]  # app.py.bak stays as a manual fallback
         print("update: %s kept after %d clean boots"
               % (state.get("sha", "?")[:7], TRIAL_BOOTS))
+        _refresh_spare()
     save(state)
+
+
+def _refresh_spare():
+    """Copy the now-trusted app.py to /backup/app.py, the spare code.py
+    restores if app.py ever goes missing. Once per kept update."""
+    try:
+        try:
+            os.mkdir(SPARE_DIR)
+        except OSError:
+            pass  # already there
+        with open(APP, "rb") as fin, open(SPARE, "wb") as fout:
+            while True:
+                chunk = fin.read(2048)
+                if not chunk:
+                    break
+                fout.write(chunk)
+    except OSError as e:
+        print("update: couldn't refresh the spare app.py: %r" % (e,))
 
 
 def in_trial():

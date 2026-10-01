@@ -18,11 +18,48 @@ except ImportError:  # updates not installed: just run the timer
 if updater:
     updater.begin_boot()
 
+BACKUPS = ("/backup/app.py", "/app.py.bak")
+
+
+def restore_app():
+    """Copy a spare app.py into place if there is one and the drive is
+    writable by code. Returns the path it restored from, or None."""
+    import os
+    import storage
+    if storage.getmount("/").readonly:
+        return None
+    for src in BACKUPS:
+        try:
+            os.stat(src)
+        except OSError:
+            continue
+        with open(src, "rb") as fin, open("/app.py", "wb") as fout:
+            while True:
+                chunk = fin.read(2048)
+                if not chunk:
+                    break
+                fout.write(chunk)
+        return src
+    return None
+
+
 try:
     import app  # runs the timer; normally ends in deep sleep
 except Exception as exc:  # noqa: BLE001 -- a crash while loading app.py
     if updater and updater.rollback("crashed while loading: %r" % (exc,)):
         supervisor.reload()  # run the restored app.py
+    # app.py gone (e.g. its file-list entry wiped by a RESET mid-write):
+    # put the spare back and start again. Only for "missing", so a spare
+    # that itself fails can't loop.
+    if isinstance(exc, ImportError) and "'app'" in str(exc):
+        try:
+            src = restore_app()
+        except Exception as e:  # noqa: BLE001
+            src = None
+            print("restore failed:", repr(e))
+        if src:
+            print("app.py was missing: restored it from", src)
+            supervisor.reload()
     import time
     import traceback
     report = "".join(traceback.format_exception(exc))
