@@ -263,7 +263,7 @@ _FAIL_LEN = 4
 # carrying the board back into range still didn't post. A quick try that
 # succeeds ends the backoff at once. RESET/power-on clears it too.
 WIFI_BACKOFF = 3600
-WIFI_QUICK_TRY = 3
+WIFI_QUICK_TRY = 5
 
 
 def _wifi_failed_at():
