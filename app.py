@@ -255,11 +255,15 @@ def wifi_networks():
 # the 4 before those the RTC time of the last failed Wi-Fi join (0 = none).
 _NET_LEN = 33
 _FAIL_LEN = 4
-# After a failed join, skip Wi-Fi for this long. Without a reachable
-# network every brew otherwise spends ~7 s trying, ignoring the buttons --
-# which looks frozen, and invites a RESET. RESET/power-on clears it, so
-# after fixing settings.toml a RESET retries straight away.
+# After a failed join, go easy on Wi-Fi for this long: each brew makes just
+# one quick try (WIFI_QUICK_TRY seconds) on the network that last worked,
+# instead of every network at 8 s apiece. Without a reachable network a
+# brew otherwise spends ~7 s trying, ignoring the buttons -- which looks
+# frozen and invites a RESET -- but a full hour of no tries meant that
+# carrying the board back into range still didn't post. A quick try that
+# succeeds ends the backoff at once. RESET/power-on clears it too.
 WIFI_BACKOFF = 3600
+WIFI_QUICK_TRY = 3
 
 
 def _wifi_failed_at():
@@ -348,25 +352,29 @@ def _wifi_join(deadline):
         return False
     failed_at = _wifi_failed_at()
     now = time.time()
-    if failed_at and failed_at <= now < failed_at + WIFI_BACKOFF:
-        _wifi["failed"] = True
-        _wifi_log("wifi: skipped (failed %d min ago; retries after %d min)"
-                  % ((now - failed_at) // 60, WIFI_BACKOFF // 60))
-        return False
-    for ssid, password, channel in wifi_networks():
+    backing_off = bool(failed_at) and failed_at <= now < failed_at + WIFI_BACKOFF
+    networks = wifi_networks()  # the network that last worked comes first
+    per_try = 8
+    if backing_off:
+        networks = networks[:1]
+        per_try = WIFI_QUICK_TRY
+        _wifi_log("wifi: quick try of %r only (failed %d min ago)"
+                  % (networks[0][0] if networks else None, (now - failed_at) // 60))
+    for ssid, password, channel in networks:
         remaining = deadline - time.monotonic()
-        if remaining < 3:
+        if remaining < per_try:
             break
         try:
             wifi.radio.connect(ssid, password, channel=channel,
-                               timeout=min(8, int(remaining)))
+                               timeout=per_try)
             _remember_network(ssid)
             _set_wifi_failed_at(0)
             return True
         except Exception as e:
             _wifi_log("wifi: failed on %r: %r" % (ssid, e))
     _wifi["failed"] = True
-    _set_wifi_failed_at(time.time())
+    if not backing_off:
+        _set_wifi_failed_at(time.time())  # start the backoff (don't extend it)
     return False
 
 
