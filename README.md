@@ -63,9 +63,11 @@ write can wipe that chunk, and every file listed in it disappears at once
 
 - The board writes nothing in normal use: `WAKE_LOG` is off by default,
   and `update.json` changes only when an update is installed.
-- Without Wi-Fi, a brew tries once and then skips Wi-Fi for an hour
-  (`WIFI_BACKOFF`), so brews stay under a second and the board never
-  looks frozen.
+- When Wi-Fi fails, the board backs off for an hour (`WIFI_BACKOFF`):
+  each brew makes just one quick try (`WIFI_QUICK_TRY`, 5 s) on the
+  network that last worked, instead of every network at 8 s apiece. A
+  try that succeeds ends the backoff at once, and RESET clears it too, so
+  the board never looks frozen and recovers as soon as it's back in range.
 - **After copying files from a computer, eject the drive and wait for it
   to disappear before pressing RESET.** macOS can finish writing the file
   list several seconds after a copy appears to be done.
