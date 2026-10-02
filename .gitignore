@@ -4,3 +4,6 @@ settings.toml
 .DS_Store
 ._*
 __pycache__/
+
+# 3D-printable case (STLs, renders, generator script): kept local only.
+case/
