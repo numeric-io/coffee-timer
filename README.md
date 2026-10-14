@@ -8,7 +8,7 @@ Freshness timer for two office coffee carafes on an Adafruit MagTag
 - **Screen:** each half shows the type, when it was brewed and minutes
   left (in 2-minute steps), and turns STALE after 120 minutes.
 - **Slack:** each brew can post to a channel (`SLACK_WEBHOOK_URL`).
-- **Battery:** the board deep-sleeps between events, waking every minute
+- **Battery:** the board deep-sleeps between events, waking every 2 minutes
   only while a pot is fresh.
 - **Updates:** on each brew the board checks this repo and installs a new
   `app.py` from `main`. A version that crashes is rolled back on its own.

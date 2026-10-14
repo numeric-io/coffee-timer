@@ -30,7 +30,8 @@ channel (see SLACK_ON_BREW).
 
 Power: the board deep-sleeps between events. A button press wakes it via
 PinAlarm and records a brew before sleeping again; a TimeAlarm
-wakes it every 60 s while a pot is still fresh to tick the countdown. Once
+wakes it every DISPLAY_STEP minutes while a pot is still fresh to move the
+countdown a step. Once
 every pot is stale (or nothing
 was ever brewed) no timer is set at all: the e-ink image simply holds with
 zero power until the next button press. Brew state lives in
@@ -76,11 +77,13 @@ except ImportError as err:
 
 DESIGN = "carafes"  # "freshness" or "carafes"
 FRESH_MINUTES = 120
-SYNC_RETRY_TICKS = 30  # re-attempt a failed clock sync after this many ticks
+SYNC_RETRY_TICKS = 30  # re-attempt a failed clock sync after this many minutes
 MAX_SYNC_TRIES = 3  # then give up on Wi-Fi until reset, to save battery
-# The countdown is shown in steps of this many minutes, and the e-ink only
-# refreshes (with its full black/white flash) when what it shows changes:
-# 5 -> ~12 flashes per pot instead of 60. Set to 1 for a per-minute display.
+# The countdown moves in steps of this many minutes. While a pot is fresh
+# the board wakes once per step, adds the step to its minute count and
+# refreshes the e-ink (a full black/white flash): ~60 wakes per 120-minute
+# pot. Waking between steps would only cost battery -- each wake is a full
+# reboot, ~1-2 s at full power. Set to 1 for a per-minute display.
 DISPLAY_STEP = 2
 # Post to Slack on every brew when SLACK_WEBHOOK_URL is set in settings.toml
 # (a Slack Workflow Builder "From a webhook" trigger with a `text` variable,
@@ -91,8 +94,8 @@ SLACK_ON_BREW = True
 # computer later), so wakes from real deep sleep -- on a charger or battery,
 # where there's no serial console -- can be diagnosed. Capped at
 # WAKE_LOG_MAX bytes. Only wakes that do something are written (brews,
-# restarts, a pot going stale, clock-sync retries); plain minute ticks just
-# print. OFF by default: a RESET or power cut in the middle of a flash
+# restarts, a pot going stale, clock-sync retries); plain countdown wakes
+# just print. OFF by default: a RESET or power cut in the middle of a flash
 # write can wipe a 4 KB chunk of the drive, file list and all -- the log
 # was being written at the end of every brew, exactly when an impatient
 # RESET lands, and that is how app.py kept vanishing. Turn on only while
@@ -159,7 +162,8 @@ def divider(parent, y0, y1):
 
 # sleep_memory layout (33 of the ESP32-S2's 4096 bytes; the last 34 bytes
 # are the last-good Wi-Fi network and boot.py's wake reason):
-#   magic, tick_now, brew0, brew1, type0, type1,
+#   magic, tick_now (minutes counted by the timer wakes), brew0, brew1
+#   (tick_now at each brew), type0, type1,
 #   epoch0, epoch1 (UTC brew times, 0 = clock was invalid),
 #   last_sync (UTC epoch of last NTP sync), clock_valid, last_try_tick,
 #   sync_tries (failed sync attempts since the clock was last valid)
@@ -642,7 +646,7 @@ def log_flush():
         return
     _wake_log["live"] = True
     if not _wake_log["persist"]:
-        _wake_log["pending"] = []  # a plain minute tick: don't touch flash
+        _wake_log["pending"] = []  # a plain countdown wake: don't touch flash
         return
     trim_wake_log()
     try:
@@ -732,32 +736,32 @@ def main():
         pressed = boot_wake - 1
     timer_wake = pressed is None and (
         isinstance(wake, alarm.time.TimeAlarm) or boot_wake == 10)
+    prev_tick = tick
     if pressed in BUTTON_ACTIONS:
         slot, brew_type = BUTTON_ACTIONS[pressed]
         brews[slot] = tick
         types[slot] = brew_type
         epochs[slot] = time.time() if valid else 0
     elif timer_wake:
-        tick += 1
+        tick += DISPLAY_STEP
 
     is_active = any((minutes_left(tick, brews, s) or 0) > 0 for s in (0, 1))
 
     save_state(tick, brews, types, epochs, last_sync, valid, last_try,
                tries)
 
-    # Both pots share one minute tick, and every refresh redraws both
-    # halves. To keep the e-ink flashes down, refresh only on boot, on a
-    # brew, when a pot goes stale, and on a shared DISPLAY_STEP-minute
-    # beat while anything is counting down -- so two pots brewed a few
-    # minutes apart still update together, not on separate minutes. The
-    # board still wakes every minute to keep time, just without a flash.
+    # Both pots share one count and one wake schedule, and every refresh
+    # redraws both halves. Refresh on boot, on a brew, when a pot goes
+    # stale, and on every timer wake while anything is counting down (each
+    # one moves the countdown a step) -- so two pots brewed a few minutes
+    # apart still update together, not on separate wakes.
     went_stale = timer_wake and any(
         brews[s] != NEVER and minutes_left(tick, brews, s) == 0
-        and minutes_left(tick - 1, brews, s) > 0 for s in (0, 1))
-    on_beat = is_active and tick % DISPLAY_STEP == 0
+        and minutes_left(prev_tick, brews, s) > 0 for s in (0, 1))
+    on_beat = timer_wake and is_active
 
     # Clock-sync decision (acted on after the screen, below). Made here so
-    # the wake log knows whether this minute tick is worth writing down.
+    # the wake log knows whether this wake is worth writing down.
     if valid and time.localtime().tm_year < 2025:
         valid, tries = False, 0
     retry_due = (not valid and tries < MAX_SYNC_TRIES
@@ -829,14 +833,15 @@ def main():
 
     pin_alarms = [alarm.pin.PinAlarm(pin=p, value=False, pull=True)
                   for p in BUTTON_PINS]
-    log(wake_start, "sleeping (%s)" % ("minute timer + buttons" if is_active
-                                     else "buttons only"))
+    log(wake_start, "sleeping (%s)" % (
+        "%d-minute timer + buttons" % DISPLAY_STEP if is_active
+        else "buttons only"))
     if is_active:
         # measured from the start of this wake, so a slow wake (refresh,
-        # light pulse, Wi-Fi) doesn't stretch the minute
-        minute = alarm.time.TimeAlarm(
-            monotonic_time=max(time.monotonic() + 5, wake_start + 60))
-        alarm.exit_and_deep_sleep_until_alarms(minute, *pin_alarms)
+        # Wi-Fi) doesn't stretch the step
+        step = alarm.time.TimeAlarm(monotonic_time=max(
+            time.monotonic() + 5, wake_start + 60 * DISPLAY_STEP))
+        alarm.exit_and_deep_sleep_until_alarms(step, *pin_alarms)
     # No pot fresh: set no timer at all. The e-ink image holds with zero
     # power until the next button press.
     alarm.exit_and_deep_sleep_until_alarms(*pin_alarms)
