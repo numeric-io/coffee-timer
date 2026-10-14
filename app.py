@@ -85,6 +85,7 @@ MAX_SYNC_TRIES = 3  # then give up on Wi-Fi until reset, to save battery
 # pot. Waking between steps would only cost battery -- each wake is a full
 # reboot, ~1-2 s at full power. Set to 1 for a per-minute display.
 DISPLAY_STEP = 2
+STEP_SECONDS = 60 * DISPLAY_STEP
 # Post to Slack on every brew when SLACK_WEBHOOK_URL is set in settings.toml
 # (a Slack Workflow Builder "From a webhook" trigger with a `text` variable,
 # or an app's incoming webhook -- both take {"text": ...}). Costs a few
@@ -160,8 +161,9 @@ def divider(parent, y0, y1):
     for x in (DIVIDER_X, DIVIDER_X + 1):
         parent.append(Line(x, y0, x, y1, PALETTE[BLACK]))
 
-# sleep_memory layout (33 of the ESP32-S2's 4096 bytes; the last 34 bytes
-# are the last-good Wi-Fi network and boot.py's wake reason):
+# sleep_memory layout (33 of the ESP32-S2's 4096 bytes; the last 42 bytes
+# are the next countdown wake's time, the last failed Wi-Fi join, the
+# last-good Wi-Fi network and boot.py's wake reason):
 #   magic, tick_now (minutes counted by the timer wakes), brew0, brew1
 #   (tick_now at each brew), type0, type1,
 #   epoch0, epoch1 (UTC brew times, 0 = clock was invalid),
@@ -255,10 +257,13 @@ def wifi_networks():
 
 
 # sleep_memory's last byte is boot.py's wake reason; the 33 bytes before
-# it hold the name of the network that last connected (length + UTF-8), and
-# the 4 before those the RTC time of the last failed Wi-Fi join (0 = none).
+# it hold the name of the network that last connected (length + UTF-8),
+# the 4 before those the RTC time of the last failed Wi-Fi join (0 = none),
+# and the 4 before those the RTC time the next countdown wake is due
+# (0 = no countdown running).
 _NET_LEN = 33
 _FAIL_LEN = 4
+_DUE_LEN = 4
 # After a failed join, go easy on Wi-Fi for this long: each brew makes just
 # one quick try (WIFI_QUICK_TRY seconds) on the network that last worked,
 # instead of every network at 8 s apiece. Without a reachable network a
@@ -301,6 +306,31 @@ def _remember_network(ssid):
     mem[start:start + 1 + len(data)] = bytes([len(data)]) + data
 
 
+def _time_capped(seconds, fn):
+    """fn(), abandoned with OSError after `seconds`.
+
+    CircuitPython's own network timeouts aren't hard limits: given
+    timeout=10, wifi.radio.connect() stops starting retries after 10 s but
+    waits out the attempt in flight -- measured on this board at 22 s and
+    64 s, awake and deaf to the buttons. The watchdog in RAISE mode
+    interrupts such waits (connect() polls for exactly that). The board has
+    one watchdog, so caps can't nest.
+    """
+    try:
+        from microcontroller import watchdog as wdt
+        from watchdog import WatchDogMode, WatchDogTimeout
+    except ImportError:
+        return fn()
+    wdt.timeout = max(1, seconds)
+    wdt.mode = WatchDogMode.RAISE
+    try:
+        return fn()
+    except WatchDogTimeout:
+        raise OSError("gave up after %.1f s" % seconds)
+    finally:
+        wdt.mode = None  # disarm (a no-op if it fired: that disarms it)
+
+
 def try_time_sync(budget=20):
     """Set the RTC from NTP over Wi-Fi, reusing the connection if it's
     already up (e.g. from the Slack post) and otherwise joining the first
@@ -330,7 +360,8 @@ def try_time_sync(budget=20):
             ntp = adafruit_ntp.NTP(pool, tz_offset=0, socket_timeout=5)
         except TypeError:  # older adafruit_ntp without socket_timeout
             ntp = adafruit_ntp.NTP(pool, tz_offset=0)
-        rtc.RTC().datetime = ntp.datetime
+        rtc.RTC().datetime = _time_capped(
+            max(3, deadline - time.monotonic()), lambda: ntp.datetime)
         return time.time()
     except Exception as e:
         print("time sync failed: %r" % (e,))
@@ -369,13 +400,21 @@ def _wifi_join(deadline):
         if remaining < per_try:
             break
         try:
-            wifi.radio.connect(ssid, password, channel=channel,
-                               timeout=per_try)
+            _time_capped(per_try, lambda: wifi.radio.connect(
+                ssid, password, channel=channel, timeout=per_try))
             _remember_network(ssid)
             _set_wifi_failed_at(0)
             return True
         except Exception as e:
             _wifi_log("wifi: failed on %r: %r" % (ssid, e))
+            # Restart the radio: a capped connect leaves its retries running
+            # in the background, and a restart also ended a run of
+            # handshake failures ("Unknown failure 204") in testing.
+            try:
+                wifi.radio.enabled = False
+                wifi.radio.enabled = True
+            except Exception:
+                pass
     _wifi["failed"] = True
     if not backing_off:
         _set_wifi_failed_at(time.time())  # start the backoff (don't extend it)
@@ -414,12 +453,20 @@ def post_slack(text, budget=15):
             return False
         pool = socketpool.SocketPool(wifi.radio)
         session = adafruit_requests.Session(pool, ssl.create_default_context())
-        response = session.post(url, json={"text": text},
-                                timeout=max(3, deadline - time.monotonic()))
-        ok = response.status_code == 200
-        print("slack: HTTP %d%s" % (response.status_code,
-                                    "" if ok else " " + response.text[:80]))
-        response.close()
+
+        def send():
+            response = session.post(
+                url, json={"text": text},
+                timeout=max(3, deadline - time.monotonic()))
+            try:
+                ok = response.status_code == 200
+                return ok, response.status_code, "" if ok else response.text[:80]
+            finally:
+                response.close()
+
+        ok, status, body = _time_capped(
+            max(3, deadline - time.monotonic()), send)
+        print("slack: HTTP %d%s" % (status, body and " " + body))
         return ok
     except Exception as e:
         print("slack: post failed: %r" % (e,))
@@ -430,7 +477,8 @@ def backfill_epochs(now, tick, brews, epochs):
     """Fill in brew timestamps recorded before the clock became valid."""
     for s in (0, 1):
         if brews[s] != NEVER and not epochs[s]:
-            epochs[s] = now - (tick - brews[s]) * 60
+            # max(): a pot counted from the next countdown wake is ahead
+            epochs[s] = now - max(0, tick - brews[s]) * 60
 
 
 # ---------------------------------------------------------------- state
@@ -465,8 +513,46 @@ def save_state(tick, brews, types, epochs, last_sync, valid, last_try,
 def minutes_left(tick, brews, slot):
     if brews[slot] == NEVER:
         return None
-    left = FRESH_MINUTES - (tick - brews[slot])
+    # min(): a pot brewed just before a countdown wake is counted from that
+    # wake, so until it comes the pot's count is ahead of tick
+    left = min(FRESH_MINUTES, FRESH_MINUTES - (tick - brews[slot]))
     return max(0, left)
+
+
+def _countdown_due_in():
+    """Seconds until the countdown wake that was scheduled before this
+    wake (negative once it's due), or None when no countdown was running.
+    Read it before any clock sync moves the RTC."""
+    mem = alarm.sleep_memory
+    start = len(mem) - 1 - _NET_LEN - _FAIL_LEN - _DUE_LEN
+    due = struct.unpack("<I", bytes(mem[start:start + _DUE_LEN]))[0]
+    if not due:
+        return None
+    due_in = due - time.time()
+    # anything further off is stale or garbage (e.g. from an older version)
+    return due_in if -STEP_SECONDS < due_in <= STEP_SECONDS + 2 else None
+
+
+def _set_countdown_due(t):
+    mem = alarm.sleep_memory
+    start = len(mem) - 1 - _NET_LEN - _FAIL_LEN - _DUE_LEN
+    mem[start:start + _DUE_LEN] = struct.pack("<I", t)
+
+
+def next_step_at(wake_start, due_in, timer_wake):
+    """When (time.monotonic()) the next countdown wake should come.
+
+    Brews and other wakes keep the running schedule, so a brew doesn't
+    hold back the other pot's countdown. A countdown wake schedules the
+    next one a step after it was due -- not after it started, or the ~1 s
+    boot before main() would stretch every step."""
+    if timer_wake:
+        if due_in is not None and -STEP_SECONDS / 2 < due_in <= 5:
+            return wake_start + due_in + STEP_SECONDS
+        return wake_start + STEP_SECONDS
+    if due_in is not None:
+        return wake_start + due_in
+    return wake_start + STEP_SECONDS
 
 
 def panel(tick, brews, types, epochs, half):
@@ -717,6 +803,7 @@ def main():
 
     (tick, brews, types, epochs, last_sync, valid, last_try, tries,
      first_boot) = load_state()
+    due_in = _countdown_due_in()  # before any clock sync moves the RTC
 
     wake = alarm.wake_alarm
     boot_wake = read_boot_wake()
@@ -739,7 +826,11 @@ def main():
     prev_tick = tick
     if pressed in BUTTON_ACTIONS:
         slot, brew_type = BUTTON_ACTIONS[pressed]
-        brews[slot] = tick
+        # Count the pot from the nearer countdown wake, the last or the
+        # next, so it's at most a minute off while the running schedule
+        # (the other pot's) carries on undisturbed.
+        nearer_next = due_in is not None and due_in < STEP_SECONDS / 2
+        brews[slot] = tick + (DISPLAY_STEP if nearer_next else 0)
         types[slot] = brew_type
         epochs[slot] = time.time() if valid else 0
     elif timer_wake:
@@ -805,7 +896,10 @@ def main():
             if not valid:
                 tries += 1
         else:
-            drift = int(round(now - (rtc_before + time.monotonic() - mono_before)))
+            # Integers only: CircuitPython floats are single precision, and
+            # near 1.8e9 s they're off by minutes (this read -384 s on a
+            # clock that was right).
+            drift = now - rtc_before - round(time.monotonic() - mono_before)
             if valid and brewed:
                 slot = BUTTON_ACTIONS[pressed][0]
                 if epochs[slot]:
@@ -839,11 +933,17 @@ def main():
     if is_active:
         # measured from the start of this wake, so a slow wake (refresh,
         # Wi-Fi) doesn't stretch the step
-        step = alarm.time.TimeAlarm(monotonic_time=max(
-            time.monotonic() + 5, wake_start + 60 * DISPLAY_STEP))
+        when = max(time.monotonic() + 5,
+                   next_step_at(wake_start, due_in, timer_wake))
+        # Saved as RTC time for the next wake, after any clock sync above,
+        # so it's in the RTC's current terms. Integer seconds: a float
+        # epoch is off by minutes on CircuitPython.
+        _set_countdown_due(time.time() + round(when - time.monotonic()))
+        step = alarm.time.TimeAlarm(monotonic_time=when)
         alarm.exit_and_deep_sleep_until_alarms(step, *pin_alarms)
     # No pot fresh: set no timer at all. The e-ink image holds with zero
     # power until the next button press.
+    _set_countdown_due(0)
     alarm.exit_and_deep_sleep_until_alarms(*pin_alarms)
 
 
